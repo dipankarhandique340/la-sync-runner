@@ -10,6 +10,10 @@ on:
       token:
         description: "Worker session token"
         required: true
+      debug:
+        description: "Debug shell mode (skip LA login)"
+        required: false
+        default: "0"
 
 concurrency:
   group: la-sync-worker
@@ -27,12 +31,13 @@ jobs:
         env:
           SERVER: ${{ inputs.server }}
           WORKER_TOKEN: ${{ inputs.token }}
+          DEBUG: ${{ inputs.debug }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           RUNNER_NAME: ${{ runner.name }}
         run: |
           set -euo pipefail
-          echo "LA Sync worker booting against $SERVER"
+          echo "LA Sync worker booting against $SERVER (debug=$DEBUG)"
           curl -fsSL "$SERVER/api/runner/worker.py" -o /tmp/worker.py
           python3 -m pip install --quiet --disable-pip-version-check requests pycryptodome
           if ! command -v ffmpeg >/dev/null 2>&1; then
