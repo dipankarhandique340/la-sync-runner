@@ -1,0 +1,30 @@
+name: Probe
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe network reachability
+        run: |
+          echo "== LA API =="
+          curl -s -m 30 -o /dev/null -w "api_root:%{http_code}\n" https://letsapproachapi.akamai.net.in/
+          curl -s -m 30 -o /tmp/login.json -w "login_post:%{http_code}\n" -X POST "https://letsapproachapi.akamai.net.in/post/userLogin?extra_details=1" \
+            -H "auth-key: appxapi" -H "client-service: Appx" -H "source: website" \
+            -H "origin: https://letsapproach.akamai.net.in" -H "referer: https://letsapproach.akamai.net.in/" \
+            --data "source=website&email=probe-not-a-user%40example.com&password=wrongpassword123&extra_details=1"
+          echo "login_body: $(head -c 200 /tmp/login.json)"
+          echo "== LA site =="
+          curl -s -m 30 -o /dev/null -w "site:%{http_code}\n" https://letsapproach.akamai.net.in/
+          echo "== LA Sync server =="
+          curl -s -m 30 -o /dev/null -w "la_health:%{http_code}\n" https://la.coortexdev.com/api/health
+          echo "== TeleDrive public =="
+          curl -s -m 30 -o /dev/null -w "td_health:%{http_code}\n" https://drive.uppvid.in/api/v1/health
+          echo "== Abyss =="
+          printf 'not-a-video' > /tmp/t.mp4
+          curl -s -m 60 -o /tmp/abyss.json -w "abyss_upload:%{http_code}\n" -F "file=@/tmp/t.mp4" http://up.hydrax.net/b2d55d9728414df2ab8538fa67b36359
+          echo "abyss_body: $(head -c 300 /tmp/abyss.json)"
+          echo "== Tooling =="
+          ffmpeg -version 2>/dev/null | head -1 || echo "ffmpeg missing"
+          python3 --version
