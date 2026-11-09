@@ -1,0 +1,41 @@
+name: LA Sync Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      server:
+        description: "LA Sync server URL"
+        required: true
+        default: "https://la.coortexdev.com"
+      token:
+        description: "Worker session token"
+        required: true
+
+concurrency:
+  group: la-sync-worker
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Bootstrap worker
+        env:
+          SERVER: ${{ inputs.server }}
+          WORKER_TOKEN: ${{ inputs.token }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          RUNNER_NAME: ${{ runner.name }}
+        run: |
+          set -euo pipefail
+          echo "LA Sync worker booting against $SERVER"
+          curl -fsSL "$SERVER/api/runner/worker.py" -o /tmp/worker.py
+          python3 -m pip install --quiet --disable-pip-version-check requests pycryptodome
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          fi
+          exec python3 -u /tmp/worker.py
