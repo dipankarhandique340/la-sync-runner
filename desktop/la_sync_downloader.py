@@ -66,9 +66,26 @@ def save_json(path: Path, data) -> None:
         pass
 
 
-def sanitize(name: str) -> str:
+def sanitize(name: str, limit: int = 90) -> str:
+    """Make a single path component valid on Windows (colons, dots, length)."""
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name or "Untitled"))
-    return name.strip().rstrip(".")[:120] or "Untitled"
+    name = re.sub(r"\s+", " ", name).strip().strip(".").strip()
+    return (name[:limit] or "Untitled")
+
+
+def winpath(path) -> str:
+    """Long-path-safe absolute path for Windows file operations."""
+    s = os.path.abspath(str(path))
+    if os.name == "nt" and not s.startswith("\\\\?\\") and len(s) > 230:
+        s = "\\\\?\\" + s
+    return s
+
+
+def file_ready(path: Path) -> bool:
+    try:
+        return os.path.exists(winpath(path)) and os.path.getsize(winpath(path)) > 1024
+    except OSError:
+        return False
 
 
 def ffmpeg_bin() -> str:
@@ -434,7 +451,8 @@ class Downloader(threading.Thread):
             raise Cancelled()
         if depth > 10:
             return
-        path = "" if is_root else ((parent_path + "/" + name).strip("/") if parent_path else name)
+        safe_name = sanitize(name, 70)
+        path = "" if is_root else ((parent_path + "/" + safe_name).strip("/") if parent_path else safe_name)
         try:
             contents = self.api.course_root(self.course_id) if is_root else self.api.folder(self.course_id, folder_id)
         except Exception as exc:
@@ -464,12 +482,15 @@ class Downloader(threading.Thread):
     def download_item(self, raw: dict, folder_path: str):
         title = sanitize(item_title(raw))
         kind = classify(raw)
-        target_dir = self.base_dir / sanitize(self.course_name) / Path(folder_path) if folder_path else self.base_dir / sanitize(self.course_name)
-        target_dir.mkdir(parents=True, exist_ok=True)
+        target_dir = self.base_dir / sanitize(self.course_name, 80)
+        for part in str(folder_path or "").split("/"):
+            if part.strip():
+                target_dir = target_dir / sanitize(part, 70)
+        os.makedirs(winpath(target_dir), exist_ok=True)
         self.status(f"{title}")
         if kind == "pdf":
             dest = target_dir / f"{title}.pdf"
-            if dest.exists() and dest.stat().st_size > 1024:
+            if file_ready(dest):
                 self.skipped += 1
                 self.log(f"skip (exists) {title[:60]}")
                 return
@@ -493,7 +514,7 @@ class Downloader(threading.Thread):
             return
 
         dest = target_dir / f"{title}.mp4"
-        if dest.exists() and dest.stat().st_size > 1024:
+        if file_ready(dest):
             self.skipped += 1
             self.log(f"skip (exists) {title[:60]}")
             return
@@ -549,7 +570,7 @@ class Downloader(threading.Thread):
             resp.raise_for_status()
             total = int(resp.headers.get("content-length") or 0)
             received = 0
-            with open(tmp, "wb") as fh:
+            with open(winpath(tmp), "wb") as fh:
                 for chunk in resp.iter_content(chunk_size=1 << 20):
                     if self.stop_event.is_set():
                         raise Cancelled()
@@ -561,7 +582,7 @@ class Downloader(threading.Thread):
                     if total:
                         pct = min(99, int(received * 100 / total))
                         self.q.put(("progress", pct, f"{received / 1e6:.1f}/{total / 1e6:.1f} MB"))
-        tmp.replace(dest)
+        os.replace(winpath(tmp), winpath(dest))
 
     def ffmpeg(self, args, timeout=7200):
         proc = subprocess.Popen(
@@ -589,7 +610,7 @@ class Downloader(threading.Thread):
         )
         self.ffmpeg([
             "-headers", headers, "-i", url,
-            "-c", "copy", "-bsf:a", "aac_adtstoasc", str(dest),
+            "-c", "copy", "-bsf:a", "aac_adtstoasc", winpath(dest),
         ])
 
     def hls(self, url: str, dest: Path):
@@ -598,6 +619,9 @@ class Downloader(threading.Thread):
         except Cancelled:
             raise
         except Exception as exc:
+            text = str(exc)
+            if "404" in text:
+                raise RuntimeError("source link is 404 (stale or deleted)")
             self.log(f"Parallel HLS failed ({exc}) — using ffmpeg", "warn")
             self.ffmpeg_hls_stream(url, dest.with_suffix(".mp4"))
 
@@ -634,19 +658,20 @@ class Downloader(threading.Thread):
         if not segs:
             raise RuntimeError("empty playlist")
 
-        parts = dest.parent / (dest.stem + "_segments")
-        shutil.rmtree(parts, ignore_errors=True)
-        parts.mkdir(parents=True, exist_ok=True)
+        parts = dest.parent / (sanitize(dest.stem, 40) + "_segments")
+        shutil.rmtree(winpath(parts), ignore_errors=True)
+        os.makedirs(winpath(parts), exist_ok=True)
         done = [0]
 
         def fetch(pair):
             idx, seg = pair
             target = parts / f"seg_{idx:06d}.ts"
+            target_str = winpath(target)
             for attempt in range(3):
                 try:
                     with sess.get(seg, headers=DL_HEADERS, stream=True, timeout=120) as r:
                         r.raise_for_status()
-                        with open(target, "wb") as fh:
+                        with open(target_str, "wb") as fh:
                             for chunk in r.iter_content(1 << 16):
                                 if self.stop_event.is_set():
                                     raise Cancelled()
@@ -679,23 +704,24 @@ class Downloader(threading.Thread):
                 out_lines.append(f"seg_{idx:06d}.ts")
                 idx += 1
         out_lines.append("#EXT-X-ENDLIST")
-        local.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
-        self.ffmpeg(["-allowed_extensions", "ALL", "-i", str(local), "-c", "copy",
-                     "-bsf:a", "aac_adtstoasc", "-threads", "0", str(dest)])
-        shutil.rmtree(parts, ignore_errors=True)
+        with open(winpath(local), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(out_lines) + "\n")
+        self.ffmpeg(["-allowed_extensions", "ALL", "-i", winpath(local), "-c", "copy",
+                     "-bsf:a", "aac_adtstoasc", "-threads", "0", winpath(dest)])
+        shutil.rmtree(winpath(parts), ignore_errors=True)
 
     def encrypted(self, cand: dict, dest: Path):
-        raw = dest.parent / (dest.stem + ".enc.mkv")
+        raw = dest.parent / (sanitize(dest.stem, 60) + ".enc.mkv")
         self.download_file(cand["url"], raw)
         key = cand.get("key")
         if not key or len(key) != 16:
             raise RuntimeError("missing AES key")
-        dec = dest.parent / (dest.stem + ".dec.mkv")
+        dec = dest.parent / (sanitize(dest.stem, 60) + ".dec.mkv")
         for mode, iv in ((AES.MODE_ECB, None), (AES.MODE_CBC, b"\x00" * 16)):
-            tmp = dest.parent / (dest.stem + ".try.mkv")
+            tmp = dest.parent / (sanitize(dest.stem, 60) + ".try.mkv")
             try:
                 cipher = AES.new(key, mode) if iv is None else AES.new(key, mode, iv)
-                with open(raw, "rb") as fin, open(tmp, "wb") as fout:
+                with open(winpath(raw), "rb") as fin, open(winpath(tmp), "wb") as fout:
                     while True:
                         chunk = fin.read(1 << 20)
                         if not chunk:
@@ -706,10 +732,10 @@ class Downloader(threading.Thread):
                         if iv is not None and pad == 0:
                             cipher = AES.new(key, AES.MODE_CBC, out[-16:])
                         fout.write(out[: len(chunk)])
-                with open(tmp, "rb") as fh:
+                with open(winpath(tmp), "rb") as fh:
                     magic = fh.read(4)
                 if magic == b"\x1a\x45\xdf\xa3":
-                    shutil.move(str(tmp), str(dec))
+                    shutil.move(winpath(tmp), winpath(dec))
                     break
             finally:
                 if tmp.exists():
@@ -717,7 +743,7 @@ class Downloader(threading.Thread):
         if not dec.exists():
             raw.unlink(missing_ok=True)
             raise RuntimeError("decrypt failed")
-        self.ffmpeg(["-i", str(dec), "-c", "copy", str(dest)])
+        self.ffmpeg(["-i", winpath(dec), "-c", "copy", winpath(dest)])
         raw.unlink(missing_ok=True)
         dec.unlink(missing_ok=True)
 
