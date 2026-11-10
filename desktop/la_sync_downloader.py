@@ -395,53 +395,68 @@ class Cancelled(Exception):
 
 
 class Downloader(threading.Thread):
-    def __init__(self, api: LaApi, course_id: str, course_name: str, base_dir: Path, out_queue: queue.Queue):
+    def __init__(self, api: LaApi, course_id: str, course_name: str, base_dir: Path,
+                 out_queue: queue.Queue, seg_workers: int = 48, parallel_videos: int = 2):
         super().__init__(daemon=True)
         self.api = api
         self.course_id = course_id
         self.course_name = course_name
         self.base_dir = base_dir
         self.q = out_queue
+        self.seg_workers = max(4, min(int(seg_workers), 96))
+        self.parallel_videos = max(1, min(int(parallel_videos), 4))
         self.stop_event = threading.Event()
-        self.done = 0
-        self.failed = 0
-        self.skipped = 0
+        self.lock = threading.Lock()
+        self.counts = {"done": 0, "failed": 0, "skipped": 0}
+        self.executor = None
         self._bytes = 0
+        self._speed_lock = threading.Lock()
         self._speed_t0 = time.monotonic()
         self._speed_bytes0 = 0
+        self._active = 0
 
-    # ── logging ─────────────────────────────────────────────────────────────
+    # ── logging / counters ─────────────────────────────────────────────────
     def log(self, msg: str, level: str = "info"):
         self.q.put(("log", f"[{time.strftime('%H:%M:%S')}] {msg}", level))
 
     def status(self, msg: str):
         self.q.put(("status", msg, ""))
 
-    def speed_tick(self):
+    def add_bytes(self, n: int):
+        with self._speed_lock:
+            self._bytes += n
         now = time.monotonic()
         if now - self._speed_t0 >= 1.0:
-            rate = (self._bytes - self._speed_bytes0) / (now - self._speed_t0)
+            with self._speed_lock:
+                rate = (self._bytes - self._speed_bytes0) / max(0.2, now - self._speed_t0)
+                self._speed_t0 = now
+                self._speed_bytes0 = self._bytes
             self.q.put(("speed", rate, ""))
-            self._speed_t0 = now
-            self._speed_bytes0 = self._bytes
 
-    def add_bytes(self, n: int):
-        self._bytes += n
-        self.speed_tick()
+    def bump(self, field: str, n: int = 1):
+        with self.lock:
+            self.counts[field] += n
+            snapshot = (self.counts["done"], self.counts["failed"], self.counts["skipped"])
+        self.q.put(("counts", snapshot, ""))
 
     # ── main ────────────────────────────────────────────────────────────────
     def run(self):
         try:
-            self.status("Scanning course…")
             self.log(f"Course: {self.course_name}  →  {self.base_dir}")
-            root_dir = self.base_dir / sanitize(self.course_name)
-            root_dir.mkdir(parents=True, exist_ok=True)
-            self.walk("-1", sanitize(self.course_name), "", 0, is_root=True)
-            self.q.put(("finished", (self.done, self.failed, self.skipped), ""))
+            self.log(f"Turbo: {self.seg_workers} connections per video · {self.parallel_videos} videos at once")
+            os.makedirs(winpath(self.base_dir / sanitize(self.course_name, 80)), exist_ok=True)
+            self.executor = ThreadPoolExecutor(max_workers=self.parallel_videos)
+            self.walk("-1", "course root", "", 0, is_root=True)
+            self.executor.shutdown(wait=True)
+            self.q.put(("finished", (self.counts["done"], self.counts["failed"], self.counts["skipped"]), ""))
         except Cancelled:
+            if self.executor:
+                self.executor.shutdown(wait=True, cancel_futures=True)
             self.log("Download stopped by user", "warn")
             self.q.put(("stopped", "", ""))
         except Exception as exc:
+            if self.executor:
+                self.executor.shutdown(wait=True, cancel_futures=True)
             self.log(f"Fatal: {exc}", "error")
             self.log(traceback.format_exc(), "error")
             self.q.put(("error", str(exc), ""))
@@ -457,41 +472,49 @@ class Downloader(threading.Thread):
             contents = self.api.course_root(self.course_id) if is_root else self.api.folder(self.course_id, folder_id)
         except Exception as exc:
             self.log(f"Could not list \"{name}\": {exc}", "error")
-            self.failed += 1
+            self.bump("failed")
             return
         self.log(f"Folder: {name or 'root'} — {len(contents['items'])} file(s), {len(contents['folders'])} sub-folder(s)")
         for raw in contents["items"]:
             if self.stop_event.is_set():
                 raise Cancelled()
-            try:
-                self.download_item(raw, path)
-            except Cancelled:
-                raise
-            except Exception as exc:
-                self.failed += 1
-                self.log(f"FAILED \"{item_title(raw)[:55]}\": {exc}", "error")
+            self.executor.submit(self.safe_item, raw, path)
         for sub in contents["folders"]:
             if self.stop_event.is_set():
                 raise Cancelled()
             sid = item_id(sub)
             if sid:
                 self.walk(sid, item_title(sub), path, depth + 1)
-        self.q.put(("counts", (self.done, self.failed, self.skipped), ""))
+
+    def safe_item(self, raw: dict, folder_path: str):
+        if self.stop_event.is_set():
+            return
+        try:
+            self.download_item(raw, folder_path)
+        except Cancelled:
+            return
+        except Exception as exc:
+            self.bump("failed")
+            self.log(f"FAILED \"{item_title(raw)[:55]}\": {exc}", "error")
 
     # ── items ───────────────────────────────────────────────────────────────
+    def target_dir(self, folder_path: str) -> Path:
+        out = self.base_dir / sanitize(self.course_name, 80)
+        for part in str(folder_path or "").split("/"):
+            if part.strip():
+                out = out / sanitize(part, 70)
+        os.makedirs(winpath(out), exist_ok=True)
+        return out
+
     def download_item(self, raw: dict, folder_path: str):
         title = sanitize(item_title(raw))
         kind = classify(raw)
-        target_dir = self.base_dir / sanitize(self.course_name, 80)
-        for part in str(folder_path or "").split("/"):
-            if part.strip():
-                target_dir = target_dir / sanitize(part, 70)
-        os.makedirs(winpath(target_dir), exist_ok=True)
+        target_dir = self.target_dir(folder_path)
         self.status(f"{title}")
         if kind == "pdf":
             dest = target_dir / f"{title}.pdf"
             if file_ready(dest):
-                self.skipped += 1
+                self.bump("skipped")
                 self.log(f"skip (exists) {title[:60]}")
                 return
             url = pdf_url(raw)
@@ -502,38 +525,46 @@ class Downloader(threading.Thread):
                     url = None
             if not url:
                 self.log(f"skip (no PDF link) {title[:60]}", "warn")
-                self.skipped += 1
+                self.bump("skipped")
                 return
             self.download_file(url, dest)
-            self.done += 1
+            self.bump("done")
             self.log(f"PDF saved: {dest.name}")
             return
         if kind != "video":
-            self.skipped += 1
+            self.bump("skipped")
             self.log(f"skip (unsupported) {title[:60]}", "warn")
             return
 
         dest = target_dir / f"{title}.mp4"
         if file_ready(dest):
-            self.skipped += 1
+            self.bump("skipped")
             self.log(f"skip (exists) {title[:60]}")
             return
-        det = raw
-        candidates = video_candidates(det)
+
+        # Fresh details first — the listing links are frequently stale (404).
+        detail = None
+        try:
+            detail = self.api.details(self.course_id, item_id(raw) or "")
+        except Exception as exc:
+            self.log(f"details unavailable ({exc}) — trying listing links", "warn")
+        candidates = video_candidates(detail or {})
         if not candidates:
-            det = self.api.details(self.course_id, item_id(raw) or "")
-            candidates = video_candidates(det)
+            candidates = video_candidates(raw)
         if not candidates:
             raise RuntimeError("no 720p source found")
+
         last_error = None
         tried = set()
-        refreshed = False
+        refreshed = detail is not None
         while True:
             pending = [c for c in candidates if c["url"] not in tried]
             if not pending and not refreshed:
                 refreshed = True
-                det = self.api.details(self.course_id, item_id(raw) or "")
-                candidates = video_candidates(det)
+                try:
+                    candidates = video_candidates(self.api.details(self.course_id, item_id(raw) or ""))
+                except Exception:
+                    candidates = []
                 continue
             if not pending:
                 break
@@ -542,7 +573,6 @@ class Downloader(threading.Thread):
                     raise Cancelled()
                 tried.add(cand["url"])
                 try:
-                    self.status(f"{title} — {cand['quality']}")
                     self.log(f"Downloading {title[:55]} ({cand['quality']})")
                     if cand["type"] == "hls":
                         self.hls(cand["url"], dest)
@@ -550,10 +580,10 @@ class Downloader(threading.Thread):
                         self.encrypted(cand, dest)
                     else:
                         self.download_file(cand["url"], dest)
-                    if not dest.exists() or dest.stat().st_size < 1024:
+                    if not os.path.exists(winpath(dest)) or os.path.getsize(winpath(dest)) < 1024:
                         raise RuntimeError("empty output")
-                    self.done += 1
-                    self.log(f"Saved: {dest.name} ({dest.stat().st_size / 1e6:.1f} MB)", "success")
+                    self.bump("done")
+                    self.log(f"Saved: {dest.name} ({os.path.getsize(winpath(dest)) / 1e6:.1f} MB)", "success")
                     return
                 except Cancelled:
                     raise
@@ -623,10 +653,14 @@ class Downloader(threading.Thread):
             if "404" in text:
                 raise RuntimeError("source link is 404 (stale or deleted)")
             self.log(f"Parallel HLS failed ({exc}) — using ffmpeg", "warn")
-            self.ffmpeg_hls_stream(url, dest.with_suffix(".mp4"))
+            self.ffmpeg_hls_stream(url, dest)
 
     def hls_parallel(self, url: str, dest: Path):
         sess = requests.Session()
+        sess.mount("https://", requests.adapters.HTTPAdapter(
+            pool_connections=self.seg_workers + 8, pool_maxsize=self.seg_workers + 8, max_retries=0))
+        sess.mount("http://", requests.adapters.HTTPAdapter(
+            pool_connections=self.seg_workers + 8, pool_maxsize=self.seg_workers + 8, max_retries=0))
         sess.headers.update({"User-Agent": UA})
 
         def text(u):
@@ -662,6 +696,7 @@ class Downloader(threading.Thread):
         shutil.rmtree(winpath(parts), ignore_errors=True)
         os.makedirs(winpath(parts), exist_ok=True)
         done = [0]
+        total = len(segs)
 
         def fetch(pair):
             idx, seg = pair
@@ -680,16 +715,16 @@ class Downloader(threading.Thread):
                                 fh.write(chunk)
                                 self.add_bytes(len(chunk))
                     done[0] += 1
-                    self.q.put(("progress", int(done[0] * 100 / len(segs)), f"{done[0]}/{len(segs)} segments"))
+                    self.q.put(("progress", int(done[0] * 100 / total), f"{done[0]}/{total} segments"))
                     return
                 except Cancelled:
                     raise
                 except Exception:
                     if attempt == 2:
                         raise
-                    time.sleep(1.5 * (attempt + 1))
+                    time.sleep(0.8 * (attempt + 1))
 
-        with ThreadPoolExecutor(max_workers=SEG_WORKERS) as pool:
+        with ThreadPoolExecutor(max_workers=self.seg_workers) as pool:
             list(pool.map(fetch, enumerate(segs)))
 
         local = parts / "index.m3u8"
@@ -738,14 +773,17 @@ class Downloader(threading.Thread):
                     shutil.move(winpath(tmp), winpath(dec))
                     break
             finally:
-                if tmp.exists():
-                    tmp.unlink(missing_ok=True)
-        if not dec.exists():
-            raw.unlink(missing_ok=True)
+                if os.path.exists(winpath(tmp)):
+                    os.unlink(winpath(tmp))
+        if not os.path.exists(winpath(dec)):
+            os.unlink(winpath(raw)) if os.path.exists(winpath(raw)) else None
             raise RuntimeError("decrypt failed")
         self.ffmpeg(["-i", winpath(dec), "-c", "copy", winpath(dest)])
-        raw.unlink(missing_ok=True)
-        dec.unlink(missing_ok=True)
+        for f in (raw, dec):
+            try:
+                os.unlink(winpath(f))
+            except OSError:
+                pass
 
 
 class App(tk.Tk):
@@ -825,6 +863,19 @@ class App(tk.Tk):
         self.dir_var = tk.StringVar(value="D:\\LA-Downloads")
         tk.Entry(out, textvariable=self.dir_var, width=58).pack(side="left", padx=8)
         ttk.Button(out, text="Browse…", command=self.choose_dir).pack(side="left")
+
+        turbo = tk.Frame(self, bg="#0b0f16")
+        turbo.pack(fill="x", **pad)
+        tk.Label(turbo, text="Connections / video", bg="#0b0f16", fg="#93a1b3").pack(side="left")
+        self.seg_var = tk.StringVar(value=str(self.conf.get("seg_workers", 48)))
+        ttk.Combobox(turbo, textvariable=self.seg_var, values=["24", "32", "48", "64", "96"],
+                     width=5, state="readonly").pack(side="left", padx=6)
+        tk.Label(turbo, text="   Videos at once", bg="#0b0f16", fg="#93a1b3").pack(side="left")
+        self.par_var = tk.StringVar(value=str(self.conf.get("parallel_videos", 2)))
+        ttk.Combobox(turbo, textvariable=self.par_var, values=["1", "2", "3", "4"],
+                     width=4, state="readonly").pack(side="left", padx=6)
+        tk.Label(turbo, text="   (higher = faster on fast lines)", bg="#0b0f16", fg="#64748b",
+                 font=("Segoe UI", 8)).pack(side="left")
 
         actions = tk.Frame(self, bg="#0b0f16")
         actions.pack(fill="x", **pad)
@@ -955,9 +1006,25 @@ class App(tk.Tk):
             messagebox.showerror("Download", f"Cannot create folder:\n{save_dir}\n{exc}")
             return
         course = self.courses[idx]
-        self.conf.update({"save_dir": str(save_dir), "email": self.email_var.get().strip()})
+        try:
+            seg_workers = int(self.seg_var.get())
+        except ValueError:
+            seg_workers = 48
+        try:
+            parallel_videos = int(self.par_var.get())
+        except ValueError:
+            parallel_videos = 2
+        self.conf.update({
+            "save_dir": str(save_dir),
+            "email": self.email_var.get().strip(),
+            "seg_workers": seg_workers,
+            "parallel_videos": parallel_videos,
+        })
         save_json(CONF_PATH, self.conf)
-        self.downloader = Downloader(self.api, course["id"], course["name"], save_dir, self.q)
+        self.downloader = Downloader(
+            self.api, course["id"], course["name"], save_dir, self.q,
+            seg_workers=seg_workers, parallel_videos=parallel_videos,
+        )
         self.downloader.start()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
