@@ -22,9 +22,12 @@ Notes
 - Nothing is uploaded anywhere.
 - Rate limits are retried automatically.
 
-Resume history
-- Completed items are recorded in D:\LA-Downloads\.la-sync\<course>.json (and in
-  %APPDATA%\LA-Sync-Downloader as backup).
+Resume history (index)
+- The index lives NEXT TO THE EXE: la-sync-index-<course>.json
+  (copies: D:\LA-Downloads\.la-sync\<course>.json and %APPDATA%\LA-Sync-Downloader).
+- Files already on disk are indexed automatically when the app scans them,
+  so they are never downloaded again even if you move/delete them later.
+- Back up this small JSON file if you want to keep your progress.
 - You can delete/move finished videos to Google Drive; the app will NOT download
   them again. It continues with the remaining lectures.
 - "Reset progress" forgets the history for the selected course.
