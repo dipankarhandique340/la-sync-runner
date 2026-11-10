@@ -21,3 +21,14 @@ Notes
 - Already downloaded files are skipped; stop/resume any time.
 - Nothing is uploaded anywhere.
 - Rate limits are retried automatically.
+
+Resume history
+- Completed items are recorded in D:\LA-Downloads\.la-sync\<course>.json (and in
+  %APPDATA%\LA-Sync-Downloader as backup).
+- You can delete/move finished videos to Google Drive; the app will NOT download
+  them again. It continues with the remaining lectures.
+- "Reset progress" forgets the history for the selected course.
+
+Disk guard
+- If the target drive has less than 4 GB free, the download pauses automatically.
+  Upload/delete some files, and it continues on its own — nothing is re-downloaded.
