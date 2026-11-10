@@ -396,7 +396,8 @@ class Cancelled(Exception):
 
 class Downloader(threading.Thread):
     def __init__(self, api: LaApi, course_id: str, course_name: str, base_dir: Path,
-                 out_queue: queue.Queue, seg_workers: int = 48, parallel_videos: int = 2):
+                 out_queue: queue.Queue, seg_workers: int = 48, parallel_videos: int = 2,
+                 skip_history: bool = True, min_free_gb: float = 4.0):
         super().__init__(daemon=True)
         self.api = api
         self.course_id = course_id
@@ -407,6 +408,12 @@ class Downloader(threading.Thread):
         self.parallel_videos = max(1, min(int(parallel_videos), 4))
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
+        self.skip_history = skip_history
+        self.min_free_bytes = int(min_free_gb * (1 << 30))
+        self.history_path = base_dir / ".la-sync" / f"{course_id}.json"
+        self.history_backup = DATA_DIR / f"completed-{course_id}.json"
+        self.completed: dict = {}
+        self._load_history()
         self.counts = {"done": 0, "failed": 0, "skipped": 0}
         self.executor = None
         self._bytes = 0
@@ -438,6 +445,53 @@ class Downloader(threading.Thread):
             self.counts[field] += n
             snapshot = (self.counts["done"], self.counts["failed"], self.counts["skipped"])
         self.q.put(("counts", snapshot, ""))
+
+    # ── history (survives deleted files) ───────────────────────────────────
+    def _load_history(self):
+        merged = {}
+        for path in (self.history_backup, self.history_path):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                items = data.get("items", data)
+                if isinstance(items, dict):
+                    merged.update(items)
+            except Exception:
+                continue
+        self.completed = merged
+        if merged:
+            self.log(f"History: {len(merged)} item(s) already downloaded in previous sessions")
+
+    def _save_history(self):
+        payload = json.dumps({"items": self.completed, "updated": int(time.time())}, ensure_ascii=False)
+        for path in (self.history_backup, self.history_path):
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(payload, encoding="utf-8")
+            except Exception:
+                pass
+
+    def _mark_done(self, la_id: str, title: str, size: int, path: str):
+        if not la_id:
+            return
+        with self.lock:
+            self.completed[la_id] = {"title": title, "size": size, "path": path, "at": int(time.time())}
+        self._save_history()
+
+    def wait_for_space(self):
+        anchor = str(Path(self.base_dir).anchor or self.base_dir)
+        while True:
+            if self.stop_event.is_set():
+                raise Cancelled()
+            try:
+                free = shutil.disk_usage(anchor).free
+            except Exception:
+                return
+            self.q.put(("disk_free", free, ""))
+            if free >= self.min_free_bytes:
+                return
+            self.q.put(("log", f"[{time.strftime('%H:%M:%S')}] PAUSED — only {free / (1 << 30):.1f} GB free on {anchor}. Upload/delete some files; it will continue automatically.", "warn"))
+            self.status(f"Paused — low disk space ({free / (1 << 30):.1f} GB free)")
+            time.sleep(10)
 
     # ── main ────────────────────────────────────────────────────────────────
     def run(self):
@@ -511,12 +565,19 @@ class Downloader(threading.Thread):
         kind = classify(raw)
         target_dir = self.target_dir(folder_path)
         self.status(f"{title}")
+        la_id = item_id(raw) or ""
         if kind == "pdf":
             dest = target_dir / f"{title}.pdf"
             if file_ready(dest):
+                self._mark_done(la_id, title, os.path.getsize(winpath(dest)), str(dest))
                 self.bump("skipped")
                 self.log(f"skip (exists) {title[:60]}")
                 return
+            if self.skip_history and la_id and la_id in self.completed:
+                self.bump("skipped")
+                self.log(f"skip (history — already downloaded before) {title[:60]}")
+                return
+            self.wait_for_space()
             url = pdf_url(raw)
             if not url:
                 try:
@@ -528,6 +589,7 @@ class Downloader(threading.Thread):
                 self.bump("skipped")
                 return
             self.download_file(url, dest)
+            self._mark_done(la_id, title, os.path.getsize(winpath(dest)), str(dest))
             self.bump("done")
             self.log(f"PDF saved: {dest.name}")
             return
@@ -538,9 +600,15 @@ class Downloader(threading.Thread):
 
         dest = target_dir / f"{title}.mp4"
         if file_ready(dest):
+            self._mark_done(la_id, title, os.path.getsize(winpath(dest)), str(dest))
             self.bump("skipped")
             self.log(f"skip (exists) {title[:60]}")
             return
+        if self.skip_history and la_id and la_id in self.completed:
+            self.bump("skipped")
+            self.log(f"skip (history — already downloaded before) {title[:60]}")
+            return
+        self.wait_for_space()
 
         # Fresh details first — the listing links are frequently stale (404).
         detail = None
@@ -582,8 +650,10 @@ class Downloader(threading.Thread):
                         self.download_file(cand["url"], dest)
                     if not os.path.exists(winpath(dest)) or os.path.getsize(winpath(dest)) < 1024:
                         raise RuntimeError("empty output")
+                    size = os.path.getsize(winpath(dest))
+                    self._mark_done(la_id, title, size, str(dest))
                     self.bump("done")
-                    self.log(f"Saved: {dest.name} ({os.path.getsize(winpath(dest)) / 1e6:.1f} MB)", "success")
+                    self.log(f"Saved: {dest.name} ({size / 1e6:.1f} MB)", "success")
                     return
                 except Cancelled:
                     raise
@@ -877,6 +947,17 @@ class App(tk.Tk):
         tk.Label(turbo, text="   (higher = faster on fast lines)", bg="#0b0f16", fg="#64748b",
                  font=("Segoe UI", 8)).pack(side="left")
 
+        hist = tk.Frame(self, bg="#0b0f16")
+        hist.pack(fill="x", **pad)
+        self.resume_var = tk.BooleanVar(value=bool(self.conf.get("resume_history", True)))
+        tk.Checkbutton(hist, text="Skip already-downloaded items even if files were moved/deleted",
+                       variable=self.resume_var, bg="#0b0f16", fg="#dbe6f5",
+                       selectcolor="#1a2332", activebackground="#0b0f16",
+                       activeforeground="#dbe6f5").pack(side="left")
+        self.disk_label = tk.Label(hist, text="", bg="#0b0f16", fg="#93a1b3")
+        self.disk_label.pack(side="right")
+        ttk.Button(hist, text="Reset progress", command=self.reset_progress).pack(side="right", padx=8)
+
         actions = tk.Frame(self, bg="#0b0f16")
         actions.pack(fill="x", **pad)
         self.start_btn = ttk.Button(actions, text="⬇  Download whole course", style="Accent.TButton",
@@ -1019,16 +1100,45 @@ class App(tk.Tk):
             "email": self.email_var.get().strip(),
             "seg_workers": seg_workers,
             "parallel_videos": parallel_videos,
+            "resume_history": bool(self.resume_var.get()),
         })
         save_json(CONF_PATH, self.conf)
         self.downloader = Downloader(
             self.api, course["id"], course["name"], save_dir, self.q,
             seg_workers=seg_workers, parallel_videos=parallel_videos,
+            skip_history=bool(self.resume_var.get()),
         )
         self.downloader.start()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress.configure(value=0)
+
+    def reset_progress(self):
+        idx = self.course_box.current()
+        if idx < 0 or idx >= len(self.courses):
+            messagebox.showwarning("Reset", "Choose a course first.")
+            return
+        course = self.courses[idx]
+        if not messagebox.askyesno("Reset progress",
+                                   f"Forget download history for\n{course['name']}?\n\nFiles on disk are NOT deleted."):
+            return
+        base = Path(self.dir_var.get().strip() or "D:\\LA-Downloads")
+        for path in (base / ".la-sync" / f"{course['id']}.json",
+                     DATA_DIR / f"completed-{course['id']}.json"):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.log(f"Progress reset for {course['name']} — everything can be downloaded again.")
+
+    def _update_disk_label(self):
+        try:
+            base = Path(self.dir_var.get().strip() or "D:\\LA-Downloads")
+            anchor = str(base.anchor or base)
+            free = shutil.disk_usage(anchor).free
+            self.disk_label.configure(text=f"{anchor}  {free / (1 << 30):.1f} GB free")
+        except Exception:
+            self.disk_label.configure(text="")
 
     def stop_download(self):
         if self.downloader:
@@ -1050,6 +1160,8 @@ class App(tk.Tk):
                         self.status_label.configure(text=f"{self.status_label.cget('text').split('  ·  ')[0]}  ·  {extra}")
                 elif kind == "speed":
                     self.speed_label.configure(text=f"{payload / 1048576:.1f} MB/s")
+                elif kind == "disk_free":
+                    self.disk_label.configure(text=f"{Path(self.dir_var.get().strip()).anchor}  {payload / (1 << 30):.1f} GB free")
                 elif kind == "counts":
                     done, failed, skipped = payload
                     self.counts_label.configure(text=f"Saved {done} · skipped {skipped} · failed {failed}")
@@ -1084,6 +1196,7 @@ class App(tk.Tk):
                     self.stop_btn.configure(state="disabled")
         except queue.Empty:
             pass
+        self._update_disk_label()
         self.after(150, self.poll)
 
 
