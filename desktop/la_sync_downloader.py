@@ -410,8 +410,11 @@ class Downloader(threading.Thread):
         self.lock = threading.Lock()
         self.skip_history = skip_history
         self.min_free_bytes = int(min_free_gb * (1 << 30))
-        self.history_path = base_dir / ".la-sync" / f"{course_id}.json"
-        self.history_backup = DATA_DIR / f"completed-{course_id}.json"
+        self.history_paths = [
+            BASE_DIR / f"la-sync-index-{course_id}.json",        # next to the EXE (primary)
+            base_dir / ".la-sync" / f"{course_id}.json",          # download root copy
+            DATA_DIR / f"completed-{course_id}.json",             # appdata backup
+        ]
         self.completed: dict = {}
         self._load_history()
         self.counts = {"done": 0, "failed": 0, "skipped": 0}
@@ -449,7 +452,7 @@ class Downloader(threading.Thread):
     # ── history (survives deleted files) ───────────────────────────────────
     def _load_history(self):
         merged = {}
-        for path in (self.history_backup, self.history_path):
+        for path in self.history_paths:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 items = data.get("items", data)
@@ -463,7 +466,7 @@ class Downloader(threading.Thread):
 
     def _save_history(self):
         payload = json.dumps({"items": self.completed, "updated": int(time.time())}, ensure_ascii=False)
-        for path in (self.history_backup, self.history_path):
+        for path in self.history_paths:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(payload, encoding="utf-8")
@@ -1123,7 +1126,8 @@ class App(tk.Tk):
                                    f"Forget download history for\n{course['name']}?\n\nFiles on disk are NOT deleted."):
             return
         base = Path(self.dir_var.get().strip() or "D:\\LA-Downloads")
-        for path in (base / ".la-sync" / f"{course['id']}.json",
+        for path in (BASE_DIR / f"la-sync-index-{course['id']}.json",
+                     base / ".la-sync" / f"{course['id']}.json",
                      DATA_DIR / f"completed-{course['id']}.json"):
             try:
                 path.unlink(missing_ok=True)
