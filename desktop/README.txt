@@ -6,14 +6,18 @@ LA Sync Downloader (Windows x64)
 2. Run LA-Sync-Downloader.exe.
 3. Enter your LA email + password and press "Login".
    (The session token is saved, so later launches skip the login.)
-4. Choose the course (the Physics batch is preselected) and the save folder.
-   Default: D:\LA-Downloads  (change it if you want another drive).
+4. Choose the course (Physics preselected) and the save folder.
+   Default: D:\LA-Downloads
 5. Press "Download whole course".
 
+Turbo settings
+- Connections / video : 48 (choose up to 96 for very fast lines)
+- Videos at once       : 2 (up to 4)
+  Together these can saturate a 1-2 Gbps connection.
+
 Notes
-- Downloads run from YOUR internet connection (residential IP) — no server limits.
-- Videos are downloaded at the highest available quality (1080p if present, else 720p).
-- PDFs are downloaded too. Folder structure is preserved.
-- Already downloaded files are skipped, so you can stop and resume any time.
+- Runs from YOUR internet connection — no server limits.
+- Videos at 720p (1080p if offered) and PDFs, full folder structure.
+- Already downloaded files are skipped; stop/resume any time.
 - Nothing is uploaded anywhere.
-- If LA temporarily rate-limits you, the app waits and retries automatically.
+- Rate limits are retried automatically.
