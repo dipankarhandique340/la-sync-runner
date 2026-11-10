@@ -876,6 +876,7 @@ class App(tk.Tk):
                 api = LaApi(email, password)
                 api.login()
                 courses = api.purchases()
+                self.q.put(("api_ready", api, ""))
                 self.q.put(("login_ok", api.uid, ""))
                 self.q.put(("courses", courses, ""))
                 self.q.put(("login_save", (email, password, api.token, api.uid), ""))
@@ -900,6 +901,8 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _set_courses(self, courses: list[dict]):
+        if courses == getattr(self, "courses", None) and courses:
+            return
         self.courses = courses
         names = [f"{c['name']}  (#{c['id']})" for c in courses]
         self.course_box["values"] = names
@@ -910,7 +913,10 @@ class App(tk.Tk):
 
     def start_download(self):
         if not self.api:
-            messagebox.showwarning("Download", "Login first.")
+            if self.email_var.get().strip() and self.pass_var.get():
+                messagebox.showinfo("Login needed", "Press the Login button once, then start the download.")
+            else:
+                messagebox.showwarning("Login needed", "Enter your email + password and press Login first.")
             return
         idx = self.course_box.current()
         if idx < 0 or idx >= len(self.courses):
@@ -956,6 +962,8 @@ class App(tk.Tk):
                     self.counts_label.configure(text=f"Saved {done} · skipped {skipped} · failed {failed}")
                 elif kind == "courses":
                     self._set_courses(payload)
+                elif kind == "api_ready":
+                    self.api = payload
                 elif kind == "login_ok":
                     self.login_status.configure(text=f"logged in · user {payload}", fg="#34d399")
                 elif kind == "login_err":
